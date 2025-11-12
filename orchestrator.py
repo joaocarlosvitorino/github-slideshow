@@ -67,6 +67,7 @@ class Config:
     OUTLOOK_CLIENT_ID = os.getenv('OUTLOOK_CLIENT_ID', '')
     OUTLOOK_CLIENT_SECRET = os.getenv('OUTLOOK_CLIENT_SECRET', '')
     OUTLOOK_TENANT_ID = os.getenv('OUTLOOK_TENANT_ID', '')
+    OUTLOOK_USER_ID = os.getenv('OUTLOOK_USER_ID', '')  # Pode ser e-mail ou ID do usuário
 
     # ClickUp
     CLICKUP_API_KEY = os.getenv('CLICKUP_API_KEY', '')
@@ -305,10 +306,11 @@ class DatabaseManager:
 class OutlookIntegration:
     """Integração com Outlook 365"""
 
-    def __init__(self, client_id: str, client_secret: str, tenant_id: str):
+    def __init__(self, client_id: str, client_secret: str, tenant_id: str, user_id: str):
         self.client_id = client_id
         self.client_secret = client_secret
         self.tenant_id = tenant_id
+        self.user_id = user_id
         self.access_token = None
         self.graph_url = "https://graph.microsoft.com/v1.0"
         logger.info("✅ Outlook Integration inicializado")
@@ -349,7 +351,11 @@ class OutlookIntegration:
             'Content-Type': 'application/json'
         }
 
-        url = f"{self.graph_url}/me/messages"
+        if not self.user_id:
+            logger.error("❌ ID do usuário do Outlook não configurado")
+            return []
+
+        url = f"{self.graph_url}/users/{self.user_id}/messages"
         params = {
             '$top': top,
             '$select': 'id,subject,from,receivedDateTime,bodyPreview,body,hasAttachments,isRead',
@@ -374,8 +380,12 @@ class OutlookIntegration:
         if not self.access_token:
             return []
 
+        if not self.user_id:
+            logger.error("❌ ID do usuário do Outlook não configurado")
+            return []
+
         headers = {'Authorization': f'Bearer {self.access_token}'}
-        url = f"{self.graph_url}/me/messages/{email_id}/attachments"
+        url = f"{self.graph_url}/users/{self.user_id}/messages/{email_id}/attachments"
 
         try:
             response = requests.get(url, headers=headers)
@@ -390,8 +400,12 @@ class OutlookIntegration:
         if not self.access_token:
             return False
 
+        if not self.user_id:
+            logger.error("❌ ID do usuário do Outlook não configurado")
+            return False
+
         headers = {'Authorization': f'Bearer {self.access_token}'}
-        url = f"{self.graph_url}/me/messages/{email_id}/attachments/{attachment_id}"
+        url = f"{self.graph_url}/users/{self.user_id}/messages/{email_id}/attachments/{attachment_id}"
 
         try:
             response = requests.get(url, headers=headers)
@@ -562,7 +576,8 @@ class Orchestrator:
         self.outlook = OutlookIntegration(
             Config.OUTLOOK_CLIENT_ID,
             Config.OUTLOOK_CLIENT_SECRET,
-            Config.OUTLOOK_TENANT_ID
+            Config.OUTLOOK_TENANT_ID,
+            Config.OUTLOOK_USER_ID
         )
         self.clickup = ClickUpIntegration(
             Config.CLICKUP_API_KEY,
