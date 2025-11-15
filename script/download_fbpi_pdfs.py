@@ -13,7 +13,7 @@ This script automates three primary actions:
 Example usage (values can also be provided via environment variables):
 
     export FBPI_EMAIL="joao.vitorino@fbvalve.com"
-    export FBPI_EMAIL_PASSWORD="Dag16332"
+    export FBPI_EMAIL_PASSWORD="<sua-senha>"
     python script/download_fbpi_pdfs.py \
         --local-dirs "C:/Users/joaoc/Documents" "C:/Users/joaoc/Downloads" \
         --dest "C:/Users/joaoc/Downloads/FB-PI-CI" \

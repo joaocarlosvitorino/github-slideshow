@@ -25,7 +25,7 @@ Set the credentials with environment variables before execution to avoid exposin
 
 ```powershell
 $env:FBPI_EMAIL = "joao.vitorino@fbvalve.com"
-$env:FBPI_EMAIL_PASSWORD = "Dag16332"
+$env:FBPI_EMAIL_PASSWORD = "<sua-senha>"
 python script/download_fbpi_pdfs.py --interactive
 ```
 
