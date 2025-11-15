@@ -71,7 +71,8 @@ def download_matching_attachments(
     """Download Outlook attachments that match the prefix and extension."""
 
     saved_files: List[str] = []
-    with connect_to_mailbox(server, email_address, password) as mailbox:
+    mailbox = connect_to_mailbox(server, email_address, password)
+    try:
         _, ids = mailbox.search(None, "ALL")
         id_list = ids[0].split()
 
@@ -103,6 +104,8 @@ def download_matching_attachments(
 
                 saved_files.append(destination_path)
                 print(f"[E-MAIL] Salvo: {destination_path}")
+    finally:
+        mailbox.logout()
 
     return saved_files
 
