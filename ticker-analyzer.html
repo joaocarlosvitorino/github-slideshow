@@ -217,13 +217,13 @@
         }));
       };
 
-      const handleAnalyze = async (ticker = selectedTicker) => {
+      const handleAnalyze = async (ticker = selectedTicker, range = period) => {
         if (!ticker) return;
         setLoading(true);
         setError('');
         setForecast(null);
         try {
-          const raw = await fetchTickerSeries(ticker, period);
+          const raw = await fetchTickerSeries(ticker, range);
           const calc = buildAnalytics(raw);
           setSeries(enrichSeries(raw, calc));
           setAnalytics(calc);
@@ -237,13 +237,13 @@
         }
       };
 
-      const handleCompare = async () => {
+      const handleCompare = async (range = period) => {
         setLoading(true);
         setError('');
         const data = {};
         try {
           for (const ticker of compareTickers) {
-            const raw = await fetchTickerSeries(ticker, period);
+            const raw = await fetchTickerSeries(ticker, range);
             data[ticker] = normalizeSeries(raw);
           }
           const baseTicker = compareTickers[0];
@@ -290,7 +290,11 @@
               {['1mo','3mo','6mo','1y'].map((p) => (
                 <button
                   key={p}
-                  onClick={() => { setPeriod(p); handleAnalyze(selectedTicker); handleCompare(); }}
+                  onClick={() => {
+                    setPeriod(p);
+                    handleAnalyze(selectedTicker, p);
+                    handleCompare(p);
+                  }}
                   className={`px-4 py-2 rounded-lg border text-sm font-medium ${period === p ? 'bg-blue-600 text-white border-blue-700' : 'bg-slate-100 text-slate-700 border-slate-200 hover:bg-slate-200'}`}
                 >
                   {p === '1y' ? '1A' : p.toUpperCase()}
