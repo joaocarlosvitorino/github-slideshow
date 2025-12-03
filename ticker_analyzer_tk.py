@@ -44,27 +44,45 @@ def to_date(timestamp: int) -> str:
     return datetime.utcfromtimestamp(timestamp).strftime("%Y-%m-%d")
 
 
-def fetch_json(url: str):
-    try:
-        request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urlopen(request) as response:
-            body = response.read()
-    except (HTTPError, URLError) as exc:
-        raise TickerError("Falha ao recuperar dados do ticker") from exc
-    return json.loads(body.decode("utf-8"))
+def _friendly_error_message(exc: Exception) -> str:
+    reason = getattr(exc, "reason", "")
+    details = str(reason or exc)
+    if "403" in details:
+        return "A requisição foi bloqueada (403). Verifique VPN/proxy e acesso à Yahoo Finance."
+    if "timed out" in details.lower():
+        return "Tempo esgotado ao contactar o provedor de dados. Confira sua conexão."
+    return details or "Erro de rede desconhecido"
+
+
+def fetch_json(urls):
+    if isinstance(urls, str):
+        urls = [urls]
+    errors = []
+    for url in urls:
+        try:
+            request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(request) as response:
+                body = response.read()
+            return json.loads(body.decode("utf-8"))
+        except (HTTPError, URLError, OSError) as exc:
+            errors.append(_friendly_error_message(exc))
+            continue
+    combined = "; ".join(errors) or "Falha ao recuperar dados do ticker"
+    raise TickerError(combined)
 
 
 def fetch_ticker_series(ticker: str, period: str):
     range_value = PERIOD_TO_RANGE.get(period, "6mo")
-    url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}.SA"
-        f"?range={range_value}&interval=1d&events=history&includeAdjustedClose=true"
-    )
-    payload = fetch_json(url)
+    base = f"{ticker}.SA?range={range_value}&interval=1d&events=history&includeAdjustedClose=true"
+    urls = [
+        f"https://query2.finance.yahoo.com/v8/finance/chart/{base}",
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{base}",
+    ]
+    payload = fetch_json(urls)
     result = payload.get("chart", {}).get("result", [])
     if not result:
         error_message = payload.get("chart", {}).get("error", {}).get("description")
-        raise TickerError(error_message or "Dados indisponíveis")
+        raise TickerError(error_message or "Dados indisponíveis para este ticker")
 
     record = result[0]
     timestamps = record.get("timestamp", [])
@@ -98,11 +116,12 @@ def fetch_ticker_series(ticker: str, period: str):
 
 
 def fetch_fundamentals(ticker: str):
-    url = (
-        "https://query1.finance.yahoo.com/v10/finance/quoteSummary/"
-        f"{ticker}.SA?modules=financialData,defaultKeyStatistics,summaryProfile"
-    )
-    payload = fetch_json(url)
+    suffix = f"{ticker}.SA?modules=financialData,defaultKeyStatistics,summaryProfile"
+    urls = [
+        f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{suffix}",
+        f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{suffix}",
+    ]
+    payload = fetch_json(urls)
     result = payload.get("quoteSummary", {}).get("result", [])
     if not result:
         return {}
@@ -520,7 +539,7 @@ class TickerAnalyzerApp:
             self.master.after(0, self._show_error, f"Erro inesperado: {exc}")
 
     def _show_error(self, message: str):
-        self._set_loading(False, "Erro ao analisar.")
+        self._set_loading(False, message)
         messagebox.showerror("Erro", message)
 
     def _render_result(self, ticker, period, series, indicators, fundamentals, forecast):
