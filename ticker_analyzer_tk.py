@@ -1,11 +1,21 @@
+import csv
 import json
 import math
 import threading
 import tkinter as tk
-from datetime import datetime
-from tkinter import messagebox, ttk
+from datetime import datetime, timedelta
+from tkinter import filedialog, messagebox, ttk
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+try:
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+except Exception:  # noqa: BLE001
+    RandomForestRegressor = None
+    mean_absolute_error = None
+    mean_squared_error = None
+    r2_score = None
 
 
 PERIOD_TO_RANGE = {
@@ -13,6 +23,16 @@ PERIOD_TO_RANGE = {
     "3m": "3mo",
     "6m": "6mo",
     "1y": "1y",
+    "2y": "2y",
+    "5y": "5y",
+}
+
+POPULAR_BY_SECTOR = {
+    "Energia": ["PETR4", "PRIO3", "RAIZ4"],
+    "Financeiro": ["ITUB4", "BBDC4", "BBAS3"],
+    "Varejo": ["MGLU3", "VIIA3", "LREN3"],
+    "Siderurgia": ["VALE3", "USIM5", "CSNA3"],
+    "Tecnologia": ["LWSA3", "POSI3", "TOTS3"],
 }
 
 
@@ -24,20 +44,23 @@ def to_date(timestamp: int) -> str:
     return datetime.utcfromtimestamp(timestamp).strftime("%Y-%m-%d")
 
 
-def fetch_ticker_series(ticker: str, period: str):
-    range_value = PERIOD_TO_RANGE.get(period, "6mo")
-    url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}.SA"
-        f"?range={range_value}&interval=1d&events=history&includeAdjustedClose=true"
-    )
+def fetch_json(url: str):
     try:
         request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urlopen(request) as response:
             body = response.read()
     except (HTTPError, URLError) as exc:
         raise TickerError("Falha ao recuperar dados do ticker") from exc
+    return json.loads(body.decode("utf-8"))
 
-    payload = json.loads(body.decode("utf-8"))
+
+def fetch_ticker_series(ticker: str, period: str):
+    range_value = PERIOD_TO_RANGE.get(period, "6mo")
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}.SA"
+        f"?range={range_value}&interval=1d&events=history&includeAdjustedClose=true"
+    )
+    payload = fetch_json(url)
     result = payload.get("chart", {}).get("result", [])
     if not result:
         error_message = payload.get("chart", {}).get("error", {}).get("description")
@@ -47,22 +70,69 @@ def fetch_ticker_series(ticker: str, period: str):
     timestamps = record.get("timestamp", [])
     quote = (record.get("indicators", {}) or {}).get("quote", [{}])[0]
     closes = quote.get("close", [])
+    highs = quote.get("high", [])
+    lows = quote.get("low", [])
+    opens = quote.get("open", [])
     volumes = quote.get("volume", [])
 
     series = []
     for idx, timestamp in enumerate(timestamps):
         close = closes[idx] if idx < len(closes) else None
+        high = highs[idx] if idx < len(highs) else None
+        low = lows[idx] if idx < len(lows) else None
+        open_ = opens[idx] if idx < len(opens) else None
         volume = volumes[idx] if idx < len(volumes) else 0
         if close is None or math.isnan(close) or close <= 0:
             continue
-        series.append({"date": to_date(timestamp), "close": float(close), "volume": int(volume)})
+        series.append(
+            {
+                "date": to_date(timestamp),
+                "open": float(open_ or close),
+                "high": float(high or close),
+                "low": float(low or close),
+                "close": float(close),
+                "volume": int(volume or 0),
+            }
+        )
     return series
 
 
-def calculate_sma(series, length):
-    values = [point["close"] for point in series]
+def fetch_fundamentals(ticker: str):
+    url = (
+        "https://query1.finance.yahoo.com/v10/finance/quoteSummary/"
+        f"{ticker}.SA?modules=financialData,defaultKeyStatistics,summaryProfile"
+    )
+    payload = fetch_json(url)
+    result = payload.get("quoteSummary", {}).get("result", [])
+    if not result:
+        return {}
+    data = result[0]
+    financial = data.get("financialData", {})
+    stats = data.get("defaultKeyStatistics", {})
+    profile = data.get("summaryProfile", {})
+
+    def safe_get(container, key):
+        value = container.get(key)
+        if isinstance(value, dict):
+            return value.get("fmt") or value.get("raw")
+        return value
+
+    return {
+        "pe": safe_get(stats, "forwardPE"),
+        "eps": safe_get(stats, "trailingEps"),
+        "market_cap": safe_get(stats, "marketCap"),
+        "beta": safe_get(stats, "beta"),
+        "sector": profile.get("sector"),
+        "industry": profile.get("industry"),
+        "debt_to_equity": safe_get(financial, "debtToEquity"),
+        "profit_margin": safe_get(financial, "profitMargins"),
+        "recommendation": safe_get(financial, "recommendationKey"),
+    }
+
+
+def calculate_sma(values, length):
     sma = []
-    for idx in range(len(series)):
+    for idx in range(len(values)):
         if idx + 1 < length:
             sma.append(None)
             continue
@@ -71,13 +141,23 @@ def calculate_sma(series, length):
     return sma
 
 
-def calculate_rsi(series, length=14):
-    if len(series) < length + 1:
+def calculate_ema(values, length):
+    if not values:
+        return []
+    k = 2 / (length + 1)
+    ema = [values[0]]
+    for price in values[1:]:
+        ema.append((price * k) + (ema[-1] * (1 - k)))
+    return ema
+
+
+def calculate_rsi(values, length=14):
+    if len(values) < length + 1:
         return []
     gains = []
     losses = []
-    for idx in range(1, len(series)):
-        delta = series[idx]["close"] - series[idx - 1]["close"]
+    for idx in range(1, len(values)):
+        delta = values[idx] - values[idx - 1]
         gains.append(delta if delta > 0 else 0)
         losses.append(-delta if delta < 0 else 0)
 
@@ -97,88 +177,292 @@ def calculate_rsi(series, length=14):
     return rsi_values
 
 
-def standard_deviation(values):
-    if not values:
+def macd(values):
+    ema12 = calculate_ema(values, 12)
+    ema26 = calculate_ema(values, 26)
+    macd_line = []
+    for i in range(len(values)):
+        if i < len(ema12) and i < len(ema26):
+            macd_line.append(ema12[i] - ema26[i])
+        else:
+            macd_line.append(None)
+    signal = calculate_ema([v for v in macd_line if v is not None], 9)
+    histogram = []
+    sig_idx = 0
+    for v in macd_line:
+        if v is None or sig_idx >= len(signal):
+            histogram.append(None)
+        else:
+            histogram.append(v - signal[sig_idx])
+            sig_idx += 1
+    return macd_line, signal, histogram
+
+
+def bollinger(values, length=20, num_std=2):
+    upper = []
+    lower = []
+    mid = calculate_sma(values, length)
+    for idx in range(len(values)):
+        if idx + 1 < length:
+            upper.append(None)
+            lower.append(None)
+            continue
+        window = values[idx + 1 - length : idx + 1]
+        mean = sum(window) / length
+        variance = sum((v - mean) ** 2 for v in window) / length
+        std = math.sqrt(variance)
+        upper.append(mean + num_std * std)
+        lower.append(mean - num_std * std)
+    return mid, upper, lower
+
+
+def annualized_volatility(returns):
+    if not returns:
         return 0.0
-    mean = sum(values) / len(values)
-    variance = sum((v - mean) ** 2 for v in values) / len(values)
-    return math.sqrt(variance)
+    mean = sum(returns) / len(returns)
+    variance = sum((r - mean) ** 2 for r in returns) / len(returns)
+    return math.sqrt(variance) * math.sqrt(252)
 
 
-def build_analytics(series):
+def sharpe_ratio(returns, risk_free=0.04):
+    if not returns:
+        return 0.0
+    daily_rf = (1 + risk_free) ** (1 / 252) - 1
+    excess = [r - daily_rf for r in returns]
+    vol = annualized_volatility(excess)
+    if vol == 0:
+        return 0.0
+    avg = sum(excess) / len(excess)
+    return (avg * 252) / vol
+
+
+def distribution(returns, bins=5):
+    if not returns:
+        return []
+    mn, mx = min(returns), max(returns)
+    if mn == mx:
+        return [(mn, mx, len(returns))]
+    step = (mx - mn) / bins
+    dist = []
+    for i in range(bins):
+        lower = mn + i * step
+        upper = lower + step
+        count = len([r for r in returns if lower <= r < upper])
+        dist.append((lower, upper, count))
+    dist[-1] = (dist[-1][0], dist[-1][1], len([r for r in returns if r >= dist[-1][0]]))
+    return dist
+
+
+def correlation_matrix(series_map):
+    tickers = list(series_map.keys())
+    returns_map = {}
+    for ticker, series in series_map.items():
+        closes = [p["close"] for p in series]
+        daily = [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes))]
+        returns_map[ticker] = daily
+
+    matrix = {}
+    for i, t1 in enumerate(tickers):
+        row = {}
+        for j, t2 in enumerate(tickers):
+            if i == j:
+                row[t2] = 1.0
+                continue
+            a = returns_map[t1]
+            b = returns_map[t2]
+            length = min(len(a), len(b))
+            if length == 0:
+                row[t2] = 0.0
+                continue
+            mean_a = sum(a[:length]) / length
+            mean_b = sum(b[:length]) / length
+            cov = sum((a[k] - mean_a) * (b[k] - mean_b) for k in range(length)) / length
+            std_a = math.sqrt(sum((a[k] - mean_a) ** 2 for k in range(length)) / length)
+            std_b = math.sqrt(sum((b[k] - mean_b) ** 2 for k in range(length)) / length)
+            row[t2] = cov / (std_a * std_b) if std_a and std_b else 0.0
+        matrix[t1] = row
+    return matrix
+
+
+def normalized_performance(series):
     if not series:
+        return []
+    base = series[0]["close"]
+    return [(p["date"], (p["close"] / base) - 1) for p in series]
+
+
+def forecast_random_forest(series, horizon=30):
+    if RandomForestRegressor is None:
         return None
     closes = [p["close"] for p in series]
-    first = series[0]
-    last = series[-1]
-    change = last["close"] - first["close"]
-    change_percent = (change / first["close"]) * 100
-    sma20 = calculate_sma(series, 20)
-    sma50 = calculate_sma(series, 50)
-    rsi = calculate_rsi(series, 14)
-    volatility = standard_deviation(closes[-20:]) * math.sqrt(252)
+    if len(closes) < 40:
+        return None
+    X, y = [], []
+    window = 5
+    for idx in range(window, len(closes)):
+        X.append(closes[idx - window : idx])
+        y.append(closes[idx])
+    model = RandomForestRegressor(n_estimators=200, random_state=42)
+    model.fit(X, y)
 
-    sma20_last = sma20[-1] if len(series) >= 20 else None
-    sma50_last = sma50[-1] if len(series) >= 50 else None
-    rsi_last = rsi[-1] if rsi else None
-    trend = "INDISPONÍVEL"
-    if sma20_last and sma50_last:
-        trend = "ALTA" if sma20_last > sma50_last else "BAIXA"
-    momentum = "INDISPONÍVEL"
-    if rsi_last:
-        momentum = (
-            "SOBRECOMPRADO" if rsi_last > 70 else "SOBREVENDIDO" if rsi_last < 30 else "NEUTRO"
-        )
+    preds = []
+    history = closes[-window:]
+    for _ in range(horizon):
+        next_price = model.predict([history])[-1]
+        preds.append(next_price)
+        history = history[1:] + [next_price]
 
-    return {
-        "current": last["close"],
-        "change": change,
-        "change_percent": change_percent,
-        "sma20": sma20_last,
-        "sma50": sma50_last,
-        "trend": trend,
-        "momentum": momentum,
-        "rsi": rsi_last,
-        "volatility": volatility,
-    }
+    actual = closes[-horizon:] if len(closes) >= horizon else closes
+    metrics = {}
+    if actual and len(actual) == horizon and mean_absolute_error:
+        metrics = {
+            "mae": float(mean_absolute_error(actual, preds[: len(actual)])),
+            "rmse": float(math.sqrt(mean_squared_error(actual, preds[: len(actual)]))),
+            "r2": float(r2_score(actual, preds[: len(actual)])),
+        }
+    else:
+        metrics = {"mae": None, "rmse": None, "r2": None}
+
+    base_date = datetime.strptime(series[-1]["date"], "%Y-%m-%d")
+    forecasted = [
+        {
+            "date": (base_date + timedelta(days=idx + 1)).strftime("%Y-%m-%d"),
+            "predicted": preds[idx],
+            "actual": actual[idx] if idx < len(actual) else None,
+        }
+        for idx in range(len(preds))
+    ]
+    return {"forecast": forecasted, "metrics": metrics, "feature_importance": getattr(model, "feature_importances_", [])}
 
 
 class TickerAnalyzerApp:
     def __init__(self, master):
         self.master = master
-        self.master.title("Ticker Analyzer B3 (Tkinter)")
+        self.master.title("B3 Ticker Analyzer - Desktop")
+        self.master.configure(bg="#0f172a")
         self.ticker_var = tk.StringVar(value="PETR4")
         self.period_var = tk.StringVar(value="6m")
+        self.compare_var = tk.StringVar(value="PETR4,VALE3,ITUB4")
         self.status_var = tk.StringVar(value="Pronto para analisar.")
         self.loading = False
-
+        self.latest_series = {}
+        self.latest_indicators = {}
+        self.latest_forecast = {}
+        self._setup_style()
         self._build_ui()
 
+    def _setup_style(self):
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("TFrame", background="#0f172a")
+        style.configure("TLabel", background="#0f172a", foreground="#e2e8f0")
+        style.configure("TButton", background="#1e293b", foreground="#e2e8f0", padding=6)
+        style.map("TButton", background=[("active", "#334155")])
+        style.configure("TLabelframe", background="#0f172a", foreground="#e2e8f0")
+        style.configure("TLabelframe.Label", background="#0f172a", foreground="#e2e8f0")
+        style.configure("Treeview", background="#0b1220", foreground="#e2e8f0", fieldbackground="#0b1220")
+        style.configure("Horizontal.TProgressbar", troughcolor="#1f2937", background="#22d3ee", bordercolor="#1f2937")
+
     def _build_ui(self):
-        container = ttk.Frame(self.master, padding=16)
-        container.grid(column=0, row=0, sticky="nsew")
-        self.master.columnconfigure(0, weight=1)
+        root = ttk.Frame(self.master, padding=14)
+        root.grid(row=0, column=0, sticky="nsew")
         self.master.rowconfigure(0, weight=1)
+        self.master.columnconfigure(0, weight=1)
 
-        ttk.Label(container, text="Ticker B3:").grid(column=0, row=0, sticky="w")
-        entry = ttk.Entry(container, textvariable=self.ticker_var, width=12)
-        entry.grid(column=1, row=0, sticky="w", padx=(4, 12))
-        entry.bind("<Return>", lambda _event: self.start_analyze())
+        # Top controls
+        control = ttk.Frame(root)
+        control.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        control.columnconfigure(6, weight=1)
 
-        ttk.Label(container, text="Período:").grid(column=2, row=0, sticky="w")
-        period_menu = ttk.OptionMenu(container, self.period_var, self.period_var.get(), *PERIOD_TO_RANGE.keys())
-        period_menu.grid(column=3, row=0, sticky="w", padx=(4, 12))
+        ttk.Label(control, text="Ticker principal:").grid(row=0, column=0, sticky="w")
+        entry = ttk.Entry(control, textvariable=self.ticker_var, width=10)
+        entry.grid(row=0, column=1, padx=6)
+        entry.bind("<Return>", lambda _e: self.start_analyze())
 
-        self.analyze_button = ttk.Button(container, text="Analisar", command=self.start_analyze)
-        self.analyze_button.grid(column=4, row=0, sticky="w")
+        ttk.Label(control, text="Período:").grid(row=0, column=2)
+        period_box = ttk.Combobox(control, textvariable=self.period_var, values=list(PERIOD_TO_RANGE.keys()), width=5)
+        period_box.grid(row=0, column=3, padx=6)
 
-        self.status_label = ttk.Label(container, textvariable=self.status_var, foreground="#334155")
-        self.status_label.grid(column=0, row=1, columnspan=5, sticky="w", pady=(8, 4))
+        analyze_btn = ttk.Button(control, text="Analisar", command=self.start_analyze)
+        analyze_btn.grid(row=0, column=4, padx=6)
 
-        self.result_text = tk.Text(container, height=12, width=70, state="disabled", background="#f8fafc")
-        self.result_text.grid(column=0, row=2, columnspan=5, sticky="nsew", pady=(8, 0))
+        ttk.Button(control, text="Exportar CSV", command=self.export_csv).grid(row=0, column=5, padx=6)
 
-        container.rowconfigure(2, weight=1)
+        ttk.Label(control, text="Comparar (até 10, separados por vírgula):").grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        compare_entry = ttk.Entry(control, textvariable=self.compare_var, width=40)
+        compare_entry.grid(row=1, column=3, columnspan=3, sticky="ew", padx=6, pady=(8, 0))
+        ttk.Button(control, text="Comparar", command=self.start_compare).grid(row=1, column=6, sticky="e", padx=6, pady=(8, 0))
+
+        ttk.Label(control, text="Tickers populares:").grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 4))
+        popular_frame = ttk.Frame(control)
+        popular_frame.grid(row=3, column=0, columnspan=7, sticky="ew")
+        col = 0
+        for sector, tickers in POPULAR_BY_SECTOR.items():
+            box = ttk.Labelframe(popular_frame, text=sector)
+            box.grid(row=0, column=col, padx=4, sticky="ew")
+            for t in tickers:
+                ttk.Button(box, text=t, command=lambda tv=t: self._set_ticker(tv)).pack(side="left", padx=2, pady=2)
+            col += 1
+
+        # Notebook
+        self.notebook = ttk.Notebook(root)
+        self.notebook.grid(row=1, column=0, sticky="nsew")
+        root.rowconfigure(1, weight=1)
+
+        self.price_tab = ttk.Frame(self.notebook)
+        self.indicators_tab = ttk.Frame(self.notebook)
+        self.analysis_tab = ttk.Frame(self.notebook)
+        self.compare_tab = ttk.Frame(self.notebook)
+        self.forecast_tab = ttk.Frame(self.notebook)
+
+        self.notebook.add(self.price_tab, text="Preço")
+        self.notebook.add(self.indicators_tab, text="Indicadores")
+        self.notebook.add(self.analysis_tab, text="Análise Completa")
+        self.notebook.add(self.compare_tab, text="Comparação")
+        self.notebook.add(self.forecast_tab, text="Previsão ML")
+
+        for tab in [self.price_tab, self.indicators_tab, self.analysis_tab, self.compare_tab, self.forecast_tab]:
+            tab.columnconfigure(0, weight=1)
+            tab.rowconfigure(0, weight=1)
+
+        self.price_text = self._make_text(self.price_tab)
+        self.indicators_text = self._make_text(self.indicators_tab)
+        self.analysis_text = self._make_text(self.analysis_tab)
+        self.compare_text = self._make_text(self.compare_tab)
+        self.forecast_text = self._make_text(self.forecast_tab)
+
+        # Status bar
+        status_bar = ttk.Frame(root)
+        status_bar.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        status_bar.columnconfigure(1, weight=1)
+        self.progress = ttk.Progressbar(status_bar, mode="indeterminate", length=160, style="Horizontal.TProgressbar")
+        self.progress.grid(row=0, column=0, padx=(0, 8))
+        self.status_label = ttk.Label(status_bar, textvariable=self.status_var)
+        self.status_label.grid(row=0, column=1, sticky="w")
+
+    def _fmt(self, value, decimals=2):
+        if value is None:
+            return "--"
+        return f"{value:.{decimals}f}"
+
+    def _make_text(self, parent):
+        text = tk.Text(parent, height=20, background="#0b1220", foreground="#e2e8f0", insertbackground="#22d3ee")
+        text.grid(row=0, column=0, sticky="nsew")
+        text.configure(state="disabled")
+        return text
+
+    def _set_ticker(self, ticker):
+        self.ticker_var.set(ticker)
+        self.start_analyze()
+
+    def _set_loading(self, loading: bool, message: str = ""):
+        self.loading = loading
+        if loading:
+            self.progress.start(12)
+        else:
+            self.progress.stop()
+        if message:
+            self.status_var.set(message)
 
     def start_analyze(self):
         if self.loading:
@@ -188,74 +472,319 @@ class TickerAnalyzerApp:
         if not ticker:
             messagebox.showwarning("Ticker inválido", "Informe um ticker, como PETR4")
             return
-
-        self._set_loading(True)
-        self.status_var.set("Carregando dados...")
+        self._set_loading(True, "Carregando dados e indicadores...")
         threading.Thread(target=self._load_ticker, args=(ticker, period), daemon=True).start()
-
-    def _set_loading(self, value: bool):
-        self.loading = value
-        state = tk.DISABLED if value else tk.NORMAL
-        self.analyze_button.configure(state=state)
 
     def _load_ticker(self, ticker: str, period: str):
         try:
             series = fetch_ticker_series(ticker, period)
-            analytics = build_analytics(series)
+            fundamentals = fetch_fundamentals(ticker)
+            closes = [p["close"] for p in series]
+            sma20 = calculate_sma(closes, 20)
+            sma50 = calculate_sma(closes, 50)
+            sma200 = calculate_sma(closes, 200)
+            rsi = calculate_rsi(closes, 14)
+            macd_line, macd_signal, macd_hist = macd(closes)
+            mid, upper, lower = bollinger(closes)
+            returns = [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes))]
+            vol = annualized_volatility(returns)
+            sharpe = sharpe_ratio(returns)
+            dist = distribution(returns, bins=8)
+            perf = normalized_performance(series)
+            forecast = forecast_random_forest(series)
+
+            indicators = {
+                "sma20": sma20[-1] if len(sma20) else None,
+                "sma50": sma50[-1] if len(sma50) else None,
+                "sma200": sma200[-1] if len(sma200) else None,
+                "rsi": rsi[-1] if len(rsi) else None,
+                "macd": macd_line[-1] if len(macd_line) else None,
+                "macd_signal": macd_signal[-1] if len(macd_signal) else None,
+                "macd_hist": macd_hist[-1] if len(macd_hist) else None,
+                "boll_mid": mid[-1] if len(mid) else None,
+                "boll_upper": upper[-1] if len(upper) else None,
+                "boll_lower": lower[-1] if len(lower) else None,
+                "volatility": vol,
+                "sharpe": sharpe,
+                "distribution": dist,
+                "performance": perf,
+            }
+
+            self.latest_series = {ticker: series}
+            self.latest_indicators = {ticker: indicators}
+            self.latest_forecast = {ticker: forecast}
+            self.master.after(0, self._render_result, ticker, period, series, indicators, fundamentals, forecast)
         except TickerError as err:
             self.master.after(0, self._show_error, str(err))
-            return
         except Exception as exc:  # noqa: BLE001
             self.master.after(0, self._show_error, f"Erro inesperado: {exc}")
-            return
-
-        self.master.after(0, self._render_result, ticker, period, series, analytics)
 
     def _show_error(self, message: str):
-        self._set_loading(False)
-        self.status_var.set("Erro ao analisar.")
+        self._set_loading(False, "Erro ao analisar.")
         messagebox.showerror("Erro", message)
 
-    def _render_result(self, ticker, period, series, analytics):
-        self._set_loading(False)
+    def _render_result(self, ticker, period, series, indicators, fundamentals, forecast):
+        self._set_loading(False, f"{ticker}.SA carregado para {period}.")
         if not series:
-            self.status_var.set("Nenhum dado encontrado.")
             return
+        self._fill_price_tab(ticker, period, series, indicators)
+        self._fill_indicators_tab(indicators)
+        self._fill_analysis_tab(ticker, fundamentals, indicators)
+        self._fill_forecast_tab(ticker, forecast)
+        self.notebook.select(self.price_tab)
 
-        self.status_var.set(f"{ticker}.SA carregado para {period}.")
-        self.result_text.configure(state="normal")
-        self.result_text.delete("1.0", tk.END)
-
-        def fmt(value, suffix=""):
-            return f"{value:.2f}{suffix}" if value is not None else "--"
-
-        self.result_text.insert(tk.END, f"Ticker: {ticker}.SA\n")
-        self.result_text.insert(tk.END, f"Período: {period}\n")
-        self.result_text.insert(tk.END, f"Último fechamento: R$ {fmt(analytics['current'])}\n")
-        self.result_text.insert(
+    def _fill_price_tab(self, ticker, period, series, indicators):
+        text = self.price_text
+        text.configure(state="normal")
+        text.delete("1.0", tk.END)
+        closes = [p["close"] for p in series]
+        latest = series[-1]
+        change = latest["close"] - series[0]["close"]
+        change_pct = (change / series[0]["close"]) * 100
+        text.insert(tk.END, f"Ticker: {ticker}.SA\n")
+        text.insert(tk.END, f"Período: {period}\n")
+        text.insert(tk.END, f"Último preço: R$ {latest['close']:.2f}\n")
+        text.insert(tk.END, f"Variação: {change:+.2f} ({change_pct:+.2f}%)\n")
+        text.insert(tk.END, f"Volume: {latest['volume']}\n")
+        text.insert(
             tk.END,
-            f"Variação: {analytics['change']:+.2f} ({analytics['change_percent']:+.2f}%)\n",
+            "SMA 20/50/200: "
+            f"{self._fmt(indicators['sma20'])} | {self._fmt(indicators['sma50'])} | {self._fmt(indicators['sma200'])}\n",
         )
-        self.result_text.insert(tk.END, f"Tendência: {analytics['trend']}\n")
-        self.result_text.insert(tk.END, f"RSI: {fmt(analytics['rsi'])} ({analytics['momentum']})\n")
-        self.result_text.insert(tk.END, f"SMA20: {fmt(analytics['sma20'])}\n")
-        self.result_text.insert(tk.END, f"SMA50: {fmt(analytics['sma50'])}\n")
-        self.result_text.insert(tk.END, f"Volatilidade anualizada: {fmt(analytics['volatility'])}%\n\n")
-
-        self.result_text.insert(tk.END, "Últimas 10 observações:\n")
-        for point in series[-10:]:
-            self.result_text.insert(
+        text.insert(
+            tk.END,
+            "Bandas de Bollinger (20): "
+            f"{self._fmt(indicators['boll_lower'])} - {self._fmt(indicators['boll_mid'])} - {self._fmt(indicators['boll_upper'])}\n\n",
+        )
+        text.insert(tk.END, "Últimas 15 observações (preço, volume):\n")
+        for row in series[-15:]:
+            text.insert(
                 tk.END,
-                f"{point['date']}: fechamento R$ {point['close']:.2f} | volume {point['volume']}\n",
+                f"{row['date']}: R$ {row['close']:.2f} | Vol {row['volume']}\n",
             )
+        text.configure(state="disabled")
 
-        self.result_text.configure(state="disabled")
+    def _fill_indicators_tab(self, indicators):
+        text = self.indicators_text
+        text.configure(state="normal")
+        text.delete("1.0", tk.END)
+        text.insert(tk.END, "Indicadores Técnicos\n")
+        text.insert(tk.END, f"RSI (14): {self._fmt(indicators['rsi'])}\n")
+        text.insert(
+            tk.END,
+            "MACD: "
+            f"{self._fmt(indicators['macd'], 4)} | Sinal: {self._fmt(indicators['macd_signal'], 4)} | "
+            f"Hist: {self._fmt(indicators['macd_hist'], 4)}\n",
+        )
+        text.insert(tk.END, f"Volatilidade anualizada: {indicators['volatility']*100:.2f}%\n")
+        text.insert(tk.END, f"Sharpe Ratio: {indicators['sharpe']:.2f}\n\n")
+
+        text.insert(tk.END, "Distribuição de retornos diários:\n")
+        for lower, upper, count in indicators.get("distribution", []):
+            text.insert(tk.END, f"{lower*100:>6.2f}% a {upper*100:>6.2f}%: {count}\n")
+
+        text.insert(tk.END, "\nDesempenho normalizado (últimos 10 pts):\n")
+        for date, perf in indicators.get("performance", [])[-10:]:
+            text.insert(tk.END, f"{date}: {perf*100:+.2f}%\n")
+        text.configure(state="disabled")
+
+    def _fill_analysis_tab(self, ticker, fundamentals, indicators):
+        text = self.analysis_text
+        text.configure(state="normal")
+        text.delete("1.0", tk.END)
+        text.insert(tk.END, "Análise Completa\n")
+        text.insert(tk.END, "Fundamentalista:\n")
+        text.insert(tk.END, f"Setor/Indústria: {fundamentals.get('sector','--')} / {fundamentals.get('industry','--')}\n")
+        text.insert(tk.END, f"P/L: {fundamentals.get('pe','--')} | EPS: {fundamentals.get('eps','--')}\n")
+        text.insert(tk.END, f"Margem: {fundamentals.get('profit_margin','--')} | Dívida/Patrimônio: {fundamentals.get('debt_to_equity','--')}\n")
+        text.insert(tk.END, f"Market Cap: {fundamentals.get('market_cap','--')} | Beta: {fundamentals.get('beta','--')}\n")
+        text.insert(tk.END, f"Recomendação: {fundamentals.get('recommendation','--')}\n\n")
+
+        text.insert(tk.END, "Técnico:\n")
+        text.insert(tk.END, f"RSI sugere: {'Sobrevendido' if indicators.get('rsi') and indicators['rsi'] < 30 else 'Neutro/Sobrecomprado'}\n")
+        text.insert(
+            tk.END,
+            "Tendência médias: "
+            f"{self._trend_text(indicators.get('sma20'), indicators.get('sma50'), indicators.get('sma200'))}\n",
+        )
+        text.insert(tk.END, f"Volatilidade/Sharpe: {indicators.get('volatility',0)*100:.2f}% / {indicators.get('sharpe',0):.2f}\n")
+        text.insert(tk.END, "Bollinger posição: ")
+        if indicators.get("boll_upper") and indicators.get("boll_lower"):
+            text.insert(
+                tk.END,
+                f"{self._boll_position(indicators)}\n",
+            )
+        else:
+            text.insert(tk.END, "--\n")
+
+        text.insert(tk.END, "\nRecomendações automáticas:\n")
+        recs = []
+        if indicators.get("rsi") and indicators["rsi"] < 30:
+            recs.append("Momentum de recuperação possível (RSI < 30)")
+        if indicators.get("macd_hist") and indicators["macd_hist"] > 0:
+            recs.append("MACD sugere cruzamento de alta")
+        if indicators.get("sharpe", 0) > 1:
+            recs.append("Relação risco/retorno atrativa (Sharpe > 1)")
+        if not recs:
+            recs.append("Sem sinais fortes; avaliar fundamentos e tendência.")
+        for rec in recs:
+            text.insert(tk.END, f"- {rec}\n")
+        text.configure(state="disabled")
+
+    def _boll_position(self, indicators):
+        lower = indicators.get("boll_lower")
+        upper = indicators.get("boll_upper")
+        mid = indicators.get("boll_mid")
+        perf = indicators.get("performance", [])
+        last_normalized = perf[-1][1] if perf else 0
+        if lower is None or upper is None or mid is None:
+            return "--"
+        if last_normalized < -0.02:
+            return "Abaixo da banda inferior (pressão de venda)"
+        if last_normalized > 0.02:
+            return "Acima da banda superior (possível sobrecompra)"
+        if last_normalized > 0:
+            return "Entre média e banda superior"
+        return "Entre média e banda inferior"
+
+    def _trend_text(self, sma20, sma50, sma200):
+        if sma20 and sma50 and sma200:
+            if sma20 > sma50 > sma200:
+                return "Tendência forte de alta"
+            if sma20 < sma50 < sma200:
+                return "Tendência forte de baixa"
+            return "Tendência neutra ou transição"
+        if sma20 and sma50:
+            return "Alta" if sma20 > sma50 else "Baixa"
+        return "Indefinida"
+
+    def _fill_forecast_tab(self, ticker, forecast):
+        text = self.forecast_text
+        text.configure(state="normal")
+        text.delete("1.0", tk.END)
+        if not forecast:
+            text.insert(tk.END, "Previsão indisponível (dados insuficientes ou scikit-learn ausente).")
+            text.configure(state="disabled")
+            return
+        metrics = forecast.get("metrics", {})
+        text.insert(tk.END, f"Modelo Random Forest - horizonte 30 dias para {ticker}\n")
+        text.insert(tk.END, f"MAE: {metrics.get('mae','--')} | RMSE: {metrics.get('rmse','--')} | R²: {metrics.get('r2','--')}\n")
+        if forecast.get("feature_importance") is not None:
+            fi = ", ".join(f"lag{i+1}:{imp:.3f}" for i, imp in enumerate(forecast["feature_importance"]))
+            text.insert(tk.END, f"Importância de features: {fi}\n\n")
+        text.insert(tk.END, "Real vs Previsto (primeiros 10):\n")
+        for row in forecast.get("forecast", [])[:10]:
+            text.insert(
+                tk.END,
+                f"{row['date']}: previsto R$ {row['predicted']:.2f} | real: "
+                f"{row['actual']:.2f if row['actual'] else '--'}\n",
+            )
+        text.configure(state="disabled")
+
+    def start_compare(self):
+        if self.loading:
+            return
+        raw = self.compare_var.get().upper()
+        tickers = [t.strip() for t in raw.split(",") if t.strip()]
+        if not tickers:
+            messagebox.showwarning("Tickers inválidos", "Informe pelo menos um ticker para comparar")
+            return
+        if len(tickers) > 10:
+            messagebox.showwarning("Limite excedido", "Use no máximo 10 tickers")
+            return
+        period = self.period_var.get()
+        self._set_loading(True, "Comparando tickers...")
+        threading.Thread(target=self._load_comparison, args=(tickers, period), daemon=True).start()
+
+    def _load_comparison(self, tickers, period):
+        try:
+            series_map = {t: fetch_ticker_series(t, period) for t in tickers}
+            corr = correlation_matrix(series_map)
+            perf_map = {t: normalized_performance(s) for t, s in series_map.items()}
+            stats = {}
+            for t, series in series_map.items():
+                closes = [p["close"] for p in series]
+                returns = [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes))]
+                stats[t] = {
+                    "return": (closes[-1] / closes[0] - 1) if closes else 0,
+                    "vol": annualized_volatility(returns),
+                    "sharpe": sharpe_ratio(returns),
+                }
+            self.latest_series = series_map
+            self.latest_indicators = stats
+            self.master.after(0, self._render_comparison, tickers, corr, perf_map, stats)
+        except Exception as exc:  # noqa: BLE001
+            self.master.after(0, self._show_error, f"Erro ao comparar: {exc}")
+
+    def _render_comparison(self, tickers, corr, perf_map, stats):
+        self._set_loading(False, "Comparação concluída.")
+        text = self.compare_text
+        text.configure(state="normal")
+        text.delete("1.0", tk.END)
+        text.insert(tk.END, "Desempenho normalizado (último dia):\n")
+        for t in tickers:
+            perf = perf_map[t][-1][1] * 100 if perf_map.get(t) else 0
+            text.insert(tk.END, f"{t}: {perf:+.2f}%\n")
+        text.insert(tk.END, "\nRisco vs Retorno:\n")
+        for t, stat in stats.items():
+            text.insert(
+                tk.END,
+                f"{t}: retorno {stat['return']*100:+.2f}% | vol {stat['vol']*100:.2f}% | sharpe {stat['sharpe']:.2f}\n",
+            )
+        text.insert(tk.END, "\nMatriz de correlação:\n")
+        header = "      " + " ".join(f"{t:>7}" for t in tickers)
+        text.insert(tk.END, header + "\n")
+        for t1 in tickers:
+            row = f"{t1:>6} " + " ".join(f"{corr[t1].get(t2,0):>7.2f}" for t2 in tickers)
+            text.insert(tk.END, row + "\n")
+        text.configure(state="disabled")
+        self.notebook.select(self.compare_tab)
+
+    def export_csv(self):
+        if not self.latest_series:
+            messagebox.showwarning("Nada para exportar", "Execute uma análise primeiro")
+            return
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+            initialfile="analise_tickers.csv",
+        )
+        if not file_path:
+            return
+        try:
+            with open(file_path, "w", newline="", encoding="utf-8") as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow([
+                    "ticker",
+                    "date",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                ])
+                for ticker, series in self.latest_series.items():
+                    for row in series:
+                        writer.writerow(
+                            [
+                                ticker,
+                                row.get("date"),
+                                row.get("open"),
+                                row.get("high"),
+                                row.get("low"),
+                                row.get("close"),
+                                row.get("volume"),
+                            ]
+                        )
+            messagebox.showinfo("Exportação", f"Dados exportados para {file_path}")
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Erro ao exportar", str(exc))
 
 
 def main():
     root = tk.Tk()
+    root.geometry("950x680")
     app = TickerAnalyzerApp(root)
-    root.minsize(680, 360)
     root.mainloop()
 
 
