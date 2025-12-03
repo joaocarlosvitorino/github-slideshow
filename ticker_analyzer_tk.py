@@ -784,14 +784,17 @@ class TickerAnalyzerApp:
         text.insert(tk.END, f"Modelo Random Forest - horizonte 30 dias para {ticker}\n")
         text.insert(tk.END, f"MAE: {metrics.get('mae','--')} | RMSE: {metrics.get('rmse','--')} | R²: {metrics.get('r2','--')}\n")
         if forecast.get("feature_importance") is not None:
-            fi = ", ".join(f"lag{i+1}:{imp:.3f}" for i, imp in enumerate(forecast["feature_importance"]))
+            fi = ", ".join(
+                f"lag{i+1}:{imp:.3f}" for i, imp in enumerate(forecast["feature_importance"])
+            )
             text.insert(tk.END, f"Importância de features: {fi}\n\n")
         text.insert(tk.END, "Real vs Previsto (primeiros 10):\n")
         for row in forecast.get("forecast", [])[:10]:
+            actual_val = row.get("actual")
+            actual_text = f"R$ {actual_val:.2f}" if actual_val is not None else "--"
             text.insert(
                 tk.END,
-                f"{row['date']}: previsto R$ {row['predicted']:.2f} | real: "
-                f"{row['actual']:.2f if row['actual'] else '--'}\n",
+                f"{row['date']}: previsto R$ {row['predicted']:.2f} | real: {actual_text}\n",
             )
         text.configure(state="disabled")
 
