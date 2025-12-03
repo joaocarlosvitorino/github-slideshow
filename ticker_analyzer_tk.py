@@ -72,6 +72,16 @@ def fetch_json(urls):
 
 
 def fetch_ticker_series(ticker: str, period: str):
+    try:
+        return _fetch_yahoo_series(ticker, period)
+    except TickerError as err:
+        detail = str(err).lower()
+        if "403" in detail or "401" in detail or "unauthorized" in detail:
+            return _fetch_stooq_series(ticker, period)
+        raise
+
+
+def _fetch_yahoo_series(ticker: str, period: str):
     range_value = PERIOD_TO_RANGE.get(period, "6mo")
     base = f"{ticker}.SA?range={range_value}&interval=1d&events=history&includeAdjustedClose=true"
     urls = [
@@ -115,20 +125,80 @@ def fetch_ticker_series(ticker: str, period: str):
     return series
 
 
+def _fetch_stooq_series(ticker: str, period: str):
+    # Stooq offers an open CSV without authentication, suitable when Yahoo blocks requests.
+    url = f"https://stooq.pl/q/d/l/?s={ticker.lower()}.sa&i=d"
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urlopen(request) as response:
+            content = response.read().decode("utf-8")
+    except Exception as exc:  # noqa: BLE001
+        raise TickerError(_friendly_error_message(exc))
+
+    lines = [line for line in content.splitlines() if line.strip()][1:]
+    if not lines:
+        raise TickerError("Dados indisponíveis para este ticker (fallback Stooq)")
+
+    def should_keep(date_str: str) -> bool:
+        try:
+            date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            return False
+        today = datetime.utcnow().date()
+        days_map = {"1m": 32, "3m": 100, "6m": 190, "1y": 370, "2y": 740, "5y": 1900}
+        limit_days = days_map.get(period, 190)
+        return (today - date_obj).days <= limit_days
+
+    series = []
+    for line in lines:
+        parts = line.split(",")
+        if len(parts) < 6:
+            continue
+        date_str, open_, high, low, close, volume = parts[:6]
+        if not should_keep(date_str):
+            continue
+        try:
+            close_f = float(close)
+            if close_f <= 0:
+                continue
+            series.append(
+                {
+                    "date": date_str,
+                    "open": float(open_ or close_f),
+                    "high": float(high or close_f),
+                    "low": float(low or close_f),
+                    "close": close_f,
+                    "volume": int(volume or 0),
+                }
+            )
+        except ValueError:
+            continue
+
+    if not series:
+        raise TickerError("Dados indisponíveis (fallback Stooq)")
+    return series
+
+
 def fetch_fundamentals(ticker: str):
-    suffix = f"{ticker}.SA?modules=financialData,defaultKeyStatistics,summaryProfile"
-    urls = [
-        f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{suffix}",
-        f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{suffix}",
-    ]
-    payload = fetch_json(urls)
-    result = payload.get("quoteSummary", {}).get("result", [])
-    if not result:
+    try:
+        suffix = f"{ticker}.SA?modules=financialData,defaultKeyStatistics,summaryProfile"
+        urls = [
+            f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{suffix}",
+            f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{suffix}",
+        ]
+        payload = fetch_json(urls)
+        result = payload.get("quoteSummary", {}).get("result", [])
+        if not result:
+            raise TickerError("Fundamentais indisponíveis no Yahoo")
+        data = result[0]
+        financial = data.get("financialData", {})
+        stats = data.get("defaultKeyStatistics", {})
+        profile = data.get("summaryProfile", {})
+    except TickerError as err:
+        detail = str(err).lower()
+        if "403" in detail or "401" in detail or "unauthorized" in detail:
+            return _fetch_brapi_fundamentals(ticker)
         return {}
-    data = result[0]
-    financial = data.get("financialData", {})
-    stats = data.get("defaultKeyStatistics", {})
-    profile = data.get("summaryProfile", {})
 
     def safe_get(container, key):
         value = container.get(key)
@@ -146,6 +216,31 @@ def fetch_fundamentals(ticker: str):
         "debt_to_equity": safe_get(financial, "debtToEquity"),
         "profit_margin": safe_get(financial, "profitMargins"),
         "recommendation": safe_get(financial, "recommendationKey"),
+    }
+
+
+def _fetch_brapi_fundamentals(ticker: str):
+    # Public brapi.dev endpoint that usually works without an API key for light usage.
+    url = f"https://brapi.dev/api/quote/{ticker}?modules=summaryProfile,financialData,defaultKeyStatistics"
+    try:
+        payload = fetch_json(url)
+    except TickerError:
+        return {}
+
+    results = payload.get("results", [])
+    if not results:
+        return {}
+    data = results[0]
+    return {
+        "pe": data.get("forwardPE") or data.get("priceEarnings"),
+        "eps": data.get("epsTrailingTwelveMonths") or data.get("trailingEps"),
+        "market_cap": data.get("marketCap"),
+        "beta": data.get("beta"),
+        "sector": data.get("sector"),
+        "industry": data.get("industry"),
+        "debt_to_equity": data.get("debtToEquity") or data.get("totalDebt"),
+        "profit_margin": data.get("profitMargins") or data.get("profit") or data.get("grossMargins"),
+        "recommendation": data.get("recommendationKey") or data.get("recommendation"),
     }
 
 
