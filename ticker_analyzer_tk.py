@@ -3,9 +3,9 @@ import math
 import threading
 import tkinter as tk
 from datetime import datetime
-from tkinter import ttk, messagebox
+from tkinter import messagebox, ttk
 from urllib.error import HTTPError, URLError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 
 PERIOD_TO_RANGE = {
@@ -31,7 +31,8 @@ def fetch_ticker_series(ticker: str, period: str):
         f"?range={range_value}&interval=1d&events=history&includeAdjustedClose=true"
     )
     try:
-        with urlopen(url) as response:
+        request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(request) as response:
             body = response.read()
     except (HTTPError, URLError) as exc:
         raise TickerError("Falha ao recuperar dados do ticker") from exc
@@ -117,19 +118,27 @@ def build_analytics(series):
     rsi = calculate_rsi(series, 14)
     volatility = standard_deviation(closes[-20:]) * math.sqrt(252)
 
+    sma20_last = sma20[-1] if len(series) >= 20 else None
+    sma50_last = sma50[-1] if len(series) >= 50 else None
+    rsi_last = rsi[-1] if rsi else None
+    trend = "INDISPONÍVEL"
+    if sma20_last and sma50_last:
+        trend = "ALTA" if sma20_last > sma50_last else "BAIXA"
+    momentum = "INDISPONÍVEL"
+    if rsi_last:
+        momentum = (
+            "SOBRECOMPRADO" if rsi_last > 70 else "SOBREVENDIDO" if rsi_last < 30 else "NEUTRO"
+        )
+
     return {
         "current": last["close"],
         "change": change,
         "change_percent": change_percent,
-        "sma20": sma20[-1],
-        "sma50": sma50[-1],
-        "trend": "ALTA" if sma20[-1] and sma50[-1] and sma20[-1] > sma50[-1] else "BAIXA",
-        "momentum": (
-            "SOBRECOMPRADO"
-            if rsi and rsi[-1] and rsi[-1] > 70
-            else "SOBREVENDIDO" if rsi and rsi[-1] and rsi[-1] < 30 else "NEUTRO"
-        ),
-        "rsi": rsi[-1] if rsi else None,
+        "sma20": sma20_last,
+        "sma50": sma50_last,
+        "trend": trend,
+        "momentum": momentum,
+        "rsi": rsi_last,
         "volatility": volatility,
     }
 
@@ -217,18 +226,21 @@ class TickerAnalyzerApp:
         self.result_text.configure(state="normal")
         self.result_text.delete("1.0", tk.END)
 
+        def fmt(value, suffix=""):
+            return f"{value:.2f}{suffix}" if value is not None else "--"
+
         self.result_text.insert(tk.END, f"Ticker: {ticker}.SA\n")
         self.result_text.insert(tk.END, f"Período: {period}\n")
-        self.result_text.insert(tk.END, f"Último fechamento: R$ {analytics['current']:.2f}\n")
+        self.result_text.insert(tk.END, f"Último fechamento: R$ {fmt(analytics['current'])}\n")
         self.result_text.insert(
             tk.END,
             f"Variação: {analytics['change']:+.2f} ({analytics['change_percent']:+.2f}%)\n",
         )
         self.result_text.insert(tk.END, f"Tendência: {analytics['trend']}\n")
-        self.result_text.insert(tk.END, f"RSI: {analytics['rsi']:.2f} ({analytics['momentum']})\n")
-        self.result_text.insert(tk.END, f"SMA20: {analytics['sma20']:.2f}\n")
-        self.result_text.insert(tk.END, f"SMA50: {analytics['sma50']:.2f}\n")
-        self.result_text.insert(tk.END, f"Volatilidade anualizada: {analytics['volatility']:.2f}%\n\n")
+        self.result_text.insert(tk.END, f"RSI: {fmt(analytics['rsi'])} ({analytics['momentum']})\n")
+        self.result_text.insert(tk.END, f"SMA20: {fmt(analytics['sma20'])}\n")
+        self.result_text.insert(tk.END, f"SMA50: {fmt(analytics['sma50'])}\n")
+        self.result_text.insert(tk.END, f"Volatilidade anualizada: {fmt(analytics['volatility'])}%\n\n")
 
         self.result_text.insert(tk.END, "Últimas 10 observações:\n")
         for point in series[-10:]:
