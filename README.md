@@ -11,3 +11,9 @@ I'm the GitHub Learning Lab bot and I'm here to help guide you in your journey t
 I'll meet you over there, can't wait to get started!
 
 This course is using the :sparkles: open source project [reveal.js](https://github.com/hakimel/reveal.js/). In some cases we’ve made changes to the history so it would behave during class, so head to the original project repo to learn more about the cool people behind this project.
+
+## Novo analisador de tickers B3
+
+Adicionamos a página `ticker-analyzer.html` com React + Recharts, leitura direta de preços/volumes do Yahoo Finance, comparação entre tickers e previsão experimental usando uma pequena rede neural TensorFlow.js.
+
+Abra o arquivo no navegador ou publique no GitHub Pages para ter a experiência completa.
