@@ -26,3 +26,7 @@ python trading_data_pipeline.py
 - **Dólar**: use `USDBRL=X` para histórico gratuito; para contratos futuros (WDO/DOL), procure feeds profissionais (corretoras/terminals) porque o Yahoo não oferece esses códigos.
 
 A saída informa quantos candles foram baixados, eventuais erros (ex.: ticker inexistente ou período maior que o permitido) e gera um dataset pronto para ser passado a modelos de machine learning.
+
+### Quer tudo em um único bloco para Colab?
+
+Use o arquivo `colab_daytrade_swingtrade.py`. Ele contém o passo a passo completo (instalação de dependências, download, preparação de dataset e previsão com dois modelos) em um único código. Basta copiar e colar em uma célula do Google Colab e ajustar os parâmetros `TICKERS`, `PERIOD` e `INTERVAL` conforme desejar.
