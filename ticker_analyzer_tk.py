@@ -449,6 +449,58 @@ def forecast_random_forest(series, horizon=30):
     return {"forecast": forecasted, "metrics": metrics, "feature_importance": getattr(model, "feature_importances_", [])}
 
 
+def forecast_linear_trend(series, horizon=30):
+    closes = [p["close"] for p in series]
+    if len(closes) < 10:
+        return None
+
+    # Simple least-squares regression over the close price index to capture linear momentum.
+    n = len(closes)
+    x_vals = list(range(n))
+    mean_x = sum(x_vals) / n
+    mean_y = sum(closes) / n
+    cov_xy = sum((x_vals[i] - mean_x) * (closes[i] - mean_y) for i in range(n))
+    var_x = sum((x - mean_x) ** 2 for x in x_vals)
+    if var_x == 0:
+        return None
+
+    slope = cov_xy / var_x
+    intercept = mean_y - slope * mean_x
+
+    history = closes[-1]
+    base_date = datetime.strptime(series[-1]["date"], "%Y-%m-%d")
+    forecasted = []
+    preds = []
+    for idx in range(1, horizon + 1):
+        next_x = n + idx - 1
+        next_price = intercept + slope * next_x
+        # guardrail against negative projections
+        next_price = max(0.01, next_price)
+        preds.append(next_price)
+        forecasted.append(
+            {
+                "date": (base_date + timedelta(days=idx)).strftime("%Y-%m-%d"),
+                "predicted": next_price,
+                "actual": closes[-horizon + idx - 1] if len(closes) >= horizon and (-horizon + idx - 1) >= 0 else None,
+            }
+        )
+
+    metrics = {}
+    actual = closes[-horizon:] if len(closes) >= horizon else closes
+    if actual:
+        mae_val = sum(abs(a - p) for a, p in zip(actual, preds[: len(actual)])) / len(actual)
+        mse_val = sum((a - p) ** 2 for a, p in zip(actual, preds[: len(actual)])) / len(actual)
+        metrics = {
+            "mae": mae_val,
+            "rmse": math.sqrt(mse_val),
+            "r2": None,
+        }
+    else:
+        metrics = {"mae": None, "rmse": None, "r2": None}
+
+    return {"forecast": forecasted, "metrics": metrics, "feature_importance": None, "slope": slope, "last": history}
+
+
 class TickerAnalyzerApp:
     def __init__(self, master):
         self.master = master
@@ -535,14 +587,20 @@ class TickerAnalyzerApp:
         self.notebook.add(self.compare_tab, text="Comparação")
         self.notebook.add(self.forecast_tab, text="Previsão ML")
 
-        for tab in [self.price_tab, self.indicators_tab, self.analysis_tab, self.compare_tab, self.forecast_tab]:
+        for tab in [self.price_tab, self.indicators_tab, self.analysis_tab, self.forecast_tab]:
             tab.columnconfigure(0, weight=1)
             tab.rowconfigure(0, weight=1)
+
+        self.compare_tab.columnconfigure(0, weight=1)
+        self.compare_tab.rowconfigure(0, weight=1)
+        self.compare_tab.rowconfigure(1, weight=1)
 
         self.price_text = self._make_text(self.price_tab)
         self.indicators_text = self._make_text(self.indicators_tab)
         self.analysis_text = self._make_text(self.analysis_tab)
-        self.compare_text = self._make_text(self.compare_tab)
+        self.compare_canvas = tk.Canvas(self.compare_tab, height=240, background="#0b1220", highlightthickness=0)
+        self.compare_canvas.grid(row=0, column=0, sticky="nsew")
+        self.compare_text = self._make_text(self.compare_tab, row=1)
         self.forecast_text = self._make_text(self.forecast_tab)
 
         # Status bar
@@ -559,9 +617,9 @@ class TickerAnalyzerApp:
             return "--"
         return f"{value:.{decimals}f}"
 
-    def _make_text(self, parent):
+    def _make_text(self, parent, row=0):
         text = tk.Text(parent, height=20, background="#0b1220", foreground="#e2e8f0", insertbackground="#22d3ee")
-        text.grid(row=0, column=0, sticky="nsew")
+        text.grid(row=row, column=0, sticky="nsew")
         text.configure(state="disabled")
         return text
 
@@ -605,7 +663,8 @@ class TickerAnalyzerApp:
             sharpe = sharpe_ratio(returns)
             dist = distribution(returns, bins=8)
             perf = normalized_performance(series)
-            forecast = forecast_random_forest(series)
+            forecast_rf = forecast_random_forest(series)
+            forecast_trend = forecast_linear_trend(series)
 
             indicators = {
                 "sma20": sma20[-1] if len(sma20) else None,
@@ -626,8 +685,8 @@ class TickerAnalyzerApp:
 
             self.latest_series = {ticker: series}
             self.latest_indicators = {ticker: indicators}
-            self.latest_forecast = {ticker: forecast}
-            self.master.after(0, self._render_result, ticker, period, series, indicators, fundamentals, forecast)
+            self.latest_forecast = {ticker: {"random_forest": forecast_rf, "trend": forecast_trend}}
+            self.master.after(0, self._render_result, ticker, period, series, indicators, fundamentals, {"random_forest": forecast_rf, "trend": forecast_trend})
         except TickerError as err:
             self.master.after(0, self._show_error, str(err))
         except Exception as exc:  # noqa: BLE001
@@ -637,14 +696,14 @@ class TickerAnalyzerApp:
         self._set_loading(False, message)
         messagebox.showerror("Erro", message)
 
-    def _render_result(self, ticker, period, series, indicators, fundamentals, forecast):
+    def _render_result(self, ticker, period, series, indicators, fundamentals, forecast_map):
         self._set_loading(False, f"{ticker}.SA carregado para {period}.")
         if not series:
             return
         self._fill_price_tab(ticker, period, series, indicators)
         self._fill_indicators_tab(indicators)
         self._fill_analysis_tab(ticker, fundamentals, indicators)
-        self._fill_forecast_tab(ticker, forecast)
+        self._fill_forecast_tab(ticker, forecast_map)
         self.notebook.select(self.price_tab)
 
     def _fill_price_tab(self, ticker, period, series, indicators):
@@ -772,30 +831,52 @@ class TickerAnalyzerApp:
             return "Alta" if sma20 > sma50 else "Baixa"
         return "Indefinida"
 
-    def _fill_forecast_tab(self, ticker, forecast):
+    def _fill_forecast_tab(self, ticker, forecast_map):
         text = self.forecast_text
         text.configure(state="normal")
         text.delete("1.0", tk.END)
-        if not forecast:
+        rf = forecast_map.get("random_forest") if forecast_map else None
+        trend = forecast_map.get("trend") if forecast_map else None
+
+        if not rf and not trend:
             text.insert(tk.END, "Previsão indisponível (dados insuficientes ou scikit-learn ausente).")
             text.configure(state="disabled")
             return
-        metrics = forecast.get("metrics", {})
-        text.insert(tk.END, f"Modelo Random Forest - horizonte 30 dias para {ticker}\n")
-        text.insert(tk.END, f"MAE: {metrics.get('mae','--')} | RMSE: {metrics.get('rmse','--')} | R²: {metrics.get('r2','--')}\n")
-        if forecast.get("feature_importance") is not None:
-            fi = ", ".join(
-                f"lag{i+1}:{imp:.3f}" for i, imp in enumerate(forecast["feature_importance"])
-            )
-            text.insert(tk.END, f"Importância de features: {fi}\n\n")
-        text.insert(tk.END, "Real vs Previsto (primeiros 10):\n")
-        for row in forecast.get("forecast", [])[:10]:
-            actual_val = row.get("actual")
-            actual_text = f"R$ {actual_val:.2f}" if actual_val is not None else "--"
+
+        if rf:
+            metrics = rf.get("metrics", {})
+            text.insert(tk.END, f"Modelo Random Forest - horizonte 30 dias para {ticker}\n")
+            text.insert(tk.END, f"MAE: {metrics.get('mae','--')} | RMSE: {metrics.get('rmse','--')} | R²: {metrics.get('r2','--')}\n")
+            if rf.get("feature_importance") is not None:
+                fi = ", ".join(
+                    f"lag{i+1}:{imp:.3f}" for i, imp in enumerate(rf["feature_importance"])
+                )
+                text.insert(tk.END, f"Importância de features: {fi}\n\n")
+            text.insert(tk.END, "Real vs Previsto (primeiros 10):\n")
+            for row in rf.get("forecast", [])[:10]:
+                actual = row.get("actual")
+                actual_str = f"{actual:.2f}" if isinstance(actual, (int, float)) else "--"
+                text.insert(
+                    tk.END,
+                    f"{row['date']}: previsto R$ {row['predicted']:.2f} | real: {actual_str}\n",
+                )
+            text.insert(tk.END, "\n")
+
+        if trend:
+            metrics = trend.get("metrics", {})
+            text.insert(tk.END, f"Modelo Linear (tendência) - horizonte 30 dias para {ticker}\n")
             text.insert(
                 tk.END,
-                f"{row['date']}: previsto R$ {row['predicted']:.2f} | real: {actual_text}\n",
+                f"MAE: {self._fmt(metrics.get('mae'))} | RMSE: {self._fmt(metrics.get('rmse'))} | R²: {metrics.get('r2','--')} | Inclinação: {self._fmt(trend.get('slope'),4)}\n",
             )
+            text.insert(tk.END, "Projeção (primeiros 10):\n")
+            for row in trend.get("forecast", [])[:10]:
+                actual = row.get("actual")
+                actual_str = f"{actual:.2f}" if isinstance(actual, (int, float)) else "--"
+                text.insert(
+                    tk.END,
+                    f"{row['date']}: previsto R$ {row['predicted']:.2f} | real: {actual_str}\n",
+                )
         text.configure(state="disabled")
 
     def start_compare(self):
@@ -835,6 +916,7 @@ class TickerAnalyzerApp:
 
     def _render_comparison(self, tickers, corr, perf_map, stats):
         self._set_loading(False, "Comparação concluída.")
+        self._draw_compare_chart(perf_map)
         text = self.compare_text
         text.configure(state="normal")
         text.delete("1.0", tk.END)
@@ -856,6 +938,56 @@ class TickerAnalyzerApp:
             text.insert(tk.END, row + "\n")
         text.configure(state="disabled")
         self.notebook.select(self.compare_tab)
+
+    def _draw_compare_chart(self, perf_map):
+        canvas = self.compare_canvas
+        canvas.delete("all")
+        canvas.update_idletasks()
+        width = int(canvas.winfo_width() or canvas["width"])
+        height = int(canvas.winfo_height() or canvas["height"])
+        if width <= 0 or height <= 0:
+            width, height = 800, 240
+
+        # flatten data
+        all_points = []
+        for perf in perf_map.values():
+            all_points.extend([p[1] for p in perf])
+        if not all_points:
+            canvas.create_text(
+                width // 2,
+                height // 2,
+                text="Sem dados para plotar comparação.",
+                fill="#e2e8f0",
+                font=("TkDefaultFont", 10),
+            )
+            return
+
+        min_v = min(all_points)
+        max_v = max(all_points)
+        if math.isclose(min_v, max_v):
+            min_v -= 0.01
+            max_v += 0.01
+
+        padding = 30
+        plot_w = width - padding * 2
+        plot_h = height - padding * 2
+        canvas.create_rectangle(padding, padding, padding + plot_w, padding + plot_h, outline="#334155")
+        canvas.create_line(padding, padding + plot_h / 2, padding + plot_w, padding + plot_h / 2, fill="#475569", dash=(2, 2))
+
+        colors = ["#22d3ee", "#a78bfa", "#f472b6", "#34d399", "#facc15", "#f97316", "#38bdf8", "#8b5cf6", "#ef4444", "#14b8a6"]
+        for idx, (ticker, perf) in enumerate(perf_map.items()):
+            if not perf:
+                continue
+            color = colors[idx % len(colors)]
+            points = []
+            for i, (_date, value) in enumerate(perf[-200:]):
+                x = padding + (i / max(1, len(perf[-200:]) - 1)) * plot_w
+                norm = (value - min_v) / (max_v - min_v)
+                y = padding + (1 - norm) * plot_h
+                points.append((x, y))
+            for i in range(1, len(points)):
+                canvas.create_line(points[i - 1][0], points[i - 1][1], points[i][0], points[i][1], fill=color, width=2)
+            canvas.create_text(padding + 70 * (idx % 5), height - 12 - 14 * (idx // 5), text=ticker, fill=color)
 
     def export_csv(self):
         if not self.latest_series:
