@@ -1,9 +1,8 @@
-"""Automation helper for Petronect email opportunities using Selenium and a pre-opened Chrome instance.
+"""Automation helper for Petronect opportunities using Selenium and a pre-opened Chrome instance.
 
-This script is a command-line friendly version of the notebook-style code provided by the user.
-It keeps the original behaviors (connect to an already-open Chrome with remote debugging,
-scrape Petronect opportunity data, save spreadsheets, and track processed opportunities),
-while adding safer defaults, clearer logging, and CLI commands.
+This script opens the public Petronect listing page, searches for opportunities by the
+desired object text (defaults to "Válvula"), iterates through all pages, downloads item
+details and attachments, and saves both a per-opportunity workbook and a master log.
 """
 
 from __future__ import annotations
@@ -41,13 +40,15 @@ import pandas as pd
 from openpyxl.styles import Font, PatternFill
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 @dataclass
 class BotConfig:
-    petronect_url: str = "https://www.petronect.com.br/irj/portal/anonymous/en"
+    petronect_url: str = (
+        "https://www.petronect.com.br/irj/go/km/docs/pccshrcontent/"
+        "Site%20Content%20(Legacy)/Portal2018/en/lista_licitacoes_publicadas_ft.html"
+    )
     root_path: Path = Path.home() / "petronect"
     delay_seconds: float = 2.0
     chrome_debug_port: int = 9222
@@ -61,19 +62,6 @@ def log(message: str, level: str = "INFO") -> None:
     icons = {"INFO": "🔵", "SUCCESS": "✅", "WARNING": "⚠️", "ERROR": "❌"}
     timestamp = datetime.now().strftime("%H:%M:%S")
     print(f"{icons.get(level, '•')} [{timestamp}] {message}")
-
-
-def extrair_opp_numero(texto: str) -> Optional[str]:
-    patterns = [
-        r"public\s+opportunity\s+(\d+)",
-        r"oportunidade\s+(?:pública\s+)?(\d+)",
-        r"opportunity[:\s]+(\d+)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, texto, re.I)
-        if match:
-            return match.group(1)
-    return None
 
 
 def criar_pasta(config: BotConfig, opp_num: str) -> Path:
@@ -184,21 +172,27 @@ def atualizar_master(config: BotConfig, opp_num: str, data: Dict[str, Dict]) -> 
 class PetronectBot:
     def __init__(self, config: BotConfig) -> None:
         self.config = config
+        self.log_file = self.config.root_path / "processed.json"
+        self.first_run_file = self.config.root_path / "first_run.flag"
         self.driver: Optional[webdriver.Chrome] = None
         self.wait: Optional[WebDriverWait] = None
         self.processed: List[str] = self.load_log()
-        self.first_run: bool = not Path("first_run.flag").exists()
+        self.first_run: bool = not self.first_run_file.exists()
 
     def load_log(self) -> List[str]:
-        if Path("processed.json").exists():
-            with open("processed.json") as file:
+        legacy = Path("processed.json")
+        if self.log_file.exists():
+            with open(self.log_file) as file:
+                return json.load(file)
+        if legacy.exists():
+            with open(legacy) as file:
                 return json.load(file)
         return []
 
     def save_log(self, opp: str) -> None:
         if opp not in self.processed:
             self.processed.append(opp)
-            with open("processed.json", "w") as file:
+            with open(self.log_file, "w") as file:
                 json.dump(self.processed, file, indent=2)
 
     def conectar_chrome_aberto(self) -> bool:
@@ -221,191 +215,209 @@ class PetronectBot:
             log("\n⚠️ Certifique-se de que:")
             log("1. Você iniciou o Chrome com depuração remota (use --open-chrome)")
             log("2. O Chrome ainda está aberto")
-            log("3. Você já fez login no email")
             return False
 
-    def buscar_emails_petronect(self) -> List[str]:
-        opps: List[str] = []
-        if not self.driver or not self.wait:
-            log("Driver não inicializado", "ERROR")
-            return opps
-
-        try:
-            if "titan" not in self.driver.current_url.lower():
-                log("Navegando para o email...", "WARNING")
-                self.driver.get("https://titan.hostgator.com.br/mail/")
-                time.sleep(3)
-
-            log("Buscando emails Petronect...")
-            try:
-                prioritarios = self.wait.until(
-                    EC.element_to_be_clickable(
-                        (By.XPATH, "//span[contains(text(), 'Prioritarios') or contains(text(), 'Priority')]")
-                    )
-                )
-                prioritarios.click()
-                time.sleep(self.config.delay_seconds)
-                log("Pasta Prioritários aberta", "SUCCESS")
-            except Exception:
-                log("Não foi possível abrir Prioritários. Tentando buscar na pasta atual...", "WARNING")
-
-            try:
-                emails = self.driver.find_elements(
-                    By.XPATH,
-                    "//*[contains(text(), 'Servicos de Notificacao Petronect') or contains(text(), 'Petronect')]",
-                )
-
-                log(f"📧 {len(emails)} emails Petronect encontrados")
-
-                max_emails = len(emails) if self.first_run else min(10, len(emails))
-                log(f"Processando {max_emails} emails...")
-
-                for index, email in enumerate(emails[:max_emails], 1):
-                    try:
-                        log(f"Email {index}/{max_emails}...", "INFO")
-                        self.driver.execute_script("arguments[0].scrollIntoView(true);", email)
-                        time.sleep(0.5)
-                        email.click()
-                        time.sleep(self.config.delay_seconds)
-
-                        body = self.driver.find_element(
-                            By.XPATH,
-                            "//div[contains(@class, 'email') or contains(@class, 'message') or contains(@class, 'body')]",
-                        )
-                        texto = body.text
-                        opp = extrair_opp_numero(texto)
-
-                        if opp:
-                            if opp not in self.processed:
-                                opps.append(opp)
-                                log(f"✅ Oportunidade {opp}", "SUCCESS")
-                            else:
-                                log(f"⏭️ {opp} já processada")
-                        else:
-                            log("⚠️ Número não encontrado", "WARNING")
-
-                        self.driver.back()
-                        time.sleep(1)
-
-                    except Exception as exc:  # noqa: BLE001
-                        log(f"Erro no email {index}: {exc}", "WARNING")
-                        continue
-
-                log(f"🎯 {len(opps)} novas oportunidades encontradas", "SUCCESS")
-                return opps
-
-            except Exception as exc:  # noqa: BLE001
-                log(f"Erro ao buscar emails: {exc}", "ERROR")
-                return opps
-
-        except Exception as exc:  # noqa: BLE001
-            log(f"Erro geral na busca: {exc}", "ERROR")
-            return opps
-
-    def acessar_petronect(self, opp: str) -> bool:
-        if not self.driver or not self.wait:
+    def navegar_para_lista(self) -> bool:
+        if not self.driver:
             log("Driver não inicializado", "ERROR")
             return False
 
         try:
-            log(f"Acessando Petronect: {opp}")
-            self.driver.execute_script("window.open('');")
-            self.driver.switch_to.window(self.driver.window_handles[-1])
-
+            log("🔗 Abrindo lista pública do Petronect...")
             self.driver.get(self.config.petronect_url)
+            self.wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
             time.sleep(self.config.delay_seconds)
-
-            btn = self.wait.until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, "//a[contains(text(), 'Open for proposals') or contains(text(), 'abrir Propostas')]")
-                )
-            )
-            btn.click()
-            time.sleep(self.config.delay_seconds)
-
-            search = self.wait.until(
-                EC.presence_of_element_located(
-                    (By.XPATH, "//input[contains(@placeholder, 'Search') or contains(@placeholder, 'Buscar')]")
-                )
-            )
-            search.clear()
-            search.send_keys(str(opp))
-            search.send_keys(Keys.ENTER)
-            time.sleep(1)
-
-            search_btn = self.driver.find_element(
-                By.XPATH, "//button[@type='submit' or contains(@class, 'search')]"
-            )
-            search_btn.click()
-            time.sleep(self.config.delay_seconds)
-
-            log("Petronect OK", "SUCCESS")
+            log("✅ Página de listagem carregada", "SUCCESS")
             return True
-
         except Exception as exc:  # noqa: BLE001
-            log(f"Erro Petronect: {exc}", "ERROR")
+            log(f"Erro ao abrir listagem: {exc}", "ERROR")
             return False
+
+    def aplicar_filtro_objeto(self, termo: str = "Válvula") -> None:
+        if not self.driver:
+            log("Driver não inicializado", "ERROR")
+            return
+
+        log(f"🎯 Aplicando filtro de Objeto: {termo}")
+        candidatos = [
+            "//label[contains(translate(., 'OBJETO', 'objeto'), 'objeto')]/following::input[1]",
+            "//input[contains(@name, 'obj') or contains(@id, 'obj')]",
+            "//input[contains(@placeholder, 'Objeto') or contains(@aria-label, 'Objeto')]",
+            "//input[@type='text']",
+        ]
+        campo_objeto = None
+        for xpath in candidatos:
+            try:
+                campo_objeto = self.wait.until(
+                    EC.presence_of_element_located((By.XPATH, xpath))
+                )
+                if campo_objeto:
+                    break
+            except Exception:
+                continue
+
+        if not campo_objeto:
+            log("⚠️ Campo 'Objeto' não localizado; seguindo sem filtro.", "WARNING")
+            return
+
+        try:
+            campo_objeto.clear()
+            campo_objeto.send_keys(termo)
+            time.sleep(0.5)
+        except Exception as exc:  # noqa: BLE001
+            log(f"Erro ao preencher filtro: {exc}", "ERROR")
+            return
+
+        botoes_ok = [
+            "//button[normalize-space(text())='OK']",
+            "//input[@type='submit' and (contains(@value,'OK') or contains(@value,'Ok'))]",
+            "//button[contains(translate(., 'ok', 'OK'), 'OK')]",
+        ]
+        for xpath in botoes_ok:
+            try:
+                botao = self.wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
+                botao.click()
+                time.sleep(self.config.delay_seconds)
+                log("✅ Filtro aplicado", "SUCCESS")
+                return
+            except Exception:
+                continue
+
+        log("⚠️ Botão de confirmação do filtro não localizado; resultados podem não estar filtrados.", "WARNING")
+
+    def coletar_oportunidades_pagina(self) -> List[str]:
+        if not self.driver:
+            log("Driver não inicializado", "ERROR")
+            return []
+
+        oportunidades: List[str] = []
+        try:
+            linhas = self.driver.find_elements(By.XPATH, "//table//tr[td]")
+            for linha in linhas:
+                try:
+                    celulas = linha.find_elements(By.TAG_NAME, "td")
+                    if not celulas:
+                        continue
+                    texto = celulas[0].text.strip()
+                    numero = re.search(r"\d+", texto)
+                    if numero:
+                        oportunidades.append(numero.group(0))
+                except Exception:
+                    continue
+
+            oportunidades_unicas = list(dict.fromkeys(oportunidades))
+            log(f"📄 {len(oportunidades_unicas)} oportunidades nesta página", "INFO")
+            return oportunidades_unicas
+        except Exception as exc:  # noqa: BLE001
+            log(f"Erro ao coletar oportunidades: {exc}", "ERROR")
+            return []
+
+    def abrir_oportunidade_da_lista(self, opp: str) -> Optional[str]:
+        if not self.driver or not self.wait:
+            log("Driver não inicializado", "ERROR")
+            return None
+
+        seletores = [
+            f"//a[contains(text(), '{opp}')]",
+            f"//td[contains(text(), '{opp}')]/a",
+            f"//td[contains(text(), '{opp}')]",
+        ]
+
+        for xpath in seletores:
+            try:
+                elemento = self.wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
+                handle_atual = self.driver.current_window_handle
+                handles_antes = set(self.driver.window_handles)
+                elemento.click()
+                time.sleep(self.config.delay_seconds)
+
+                handles_depois = set(self.driver.window_handles)
+                novos = handles_depois - handles_antes
+                if novos:
+                    novo_handle = novos.pop()
+                    self.driver.switch_to.window(novo_handle)
+                    log(f"🆕 Oportunidade {opp} aberta em nova aba", "INFO")
+                    return handle_atual
+
+                log(f"➡️ Navegando para detalhes da oportunidade {opp}", "INFO")
+                return handle_atual
+            except Exception:
+                continue
+
+        log(f"⚠️ Não foi possível abrir a oportunidade {opp}", "WARNING")
+        return None
+
+    def voltar_para_lista(self, lista_handle: str) -> None:
+        if not self.driver:
+            return
+        try:
+            if lista_handle != self.driver.current_window_handle:
+                self.driver.close()
+                self.driver.switch_to.window(lista_handle)
+            else:
+                self.driver.back()
+            time.sleep(self.config.delay_seconds)
+        except Exception:
+            pass
+
+    def _texto_depois_de_label(self, termos: List[str]) -> str:
+        if not self.driver:
+            return ""
+        lower_from = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÂÃÀÉÊÍÓÔÕÚÇ"
+        lower_to = "abcdefghijklmnopqrstuvwxyzáâãàéêíóôõúç"
+        for termo in termos:
+            xpath = (
+                f"//*[contains(translate(normalize-space(text()), '{lower_from}', '{lower_to}'), "
+                f"'{termo.lower()}')]/following::*[1]"
+            )
+            try:
+                elemento = self.driver.find_element(By.XPATH, xpath)
+                valor = elemento.text.strip()
+                if valor:
+                    return valor
+            except Exception:
+                continue
+        return ""
 
     def extrair_dados(self) -> Dict[str, Dict]:
         data: Dict[str, Dict] = {"header": {}, "items": []}
-        if not self.driver or not self.wait:
+        if not self.driver:
             log("Driver não inicializado", "ERROR")
             return data
 
         try:
-            info_btn = self.wait.until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, "//button[contains(@title, 'Information') or contains(@class, 'info')]")
-                )
+            data["header"]["opportunity_number"] = self._texto_depois_de_label(
+                ["opportunity", "oportunidade"]
             )
-            info_btn.click()
-            time.sleep(self.config.delay_seconds)
+            data["header"]["purchasing_object"] = self._texto_depois_de_label(
+                ["purchasing object", "objeto"]
+            )
+            data["header"]["start_date"] = self._texto_depois_de_label(
+                ["start date", "início", "inicio"]
+            )
+            data["header"]["end_date"] = self._texto_depois_de_label(["end date", "fim", "encerramento"])
 
-            try:
-                data["header"]["opportunity_number"] = self.driver.find_element(
-                    By.XPATH, "//label[contains(text(), 'Opportunity')]/following-sibling::*"
-                ).text
-            except Exception:
-                pass
+            tabelas = self.driver.find_elements(
+                By.XPATH,
+                "//table[.//th[contains(translate(normalize-space(.),'ITEM','item'),'item')]]",
+            )
+            alvo = tabelas[0] if tabelas else None
+            if not alvo:
+                alvo = self.driver.find_element(By.XPATH, "//table")
 
-            try:
-                data["header"]["purchasing_object"] = self.driver.find_element(
-                    By.XPATH, "//label[contains(text(), 'Purchasing')]/following-sibling::*"
-                ).text
-            except Exception:
-                pass
-
-            try:
-                data["header"]["start_date"] = self.driver.find_element(
-                    By.XPATH, "//label[contains(text(), 'Start')]/following-sibling::*"
-                ).text
-            except Exception:
-                pass
-
-            try:
-                data["header"]["end_date"] = self.driver.find_element(
-                    By.XPATH, "//label[contains(text(), 'End')]/following-sibling::*"
-                ).text
-            except Exception:
-                pass
-
-            try:
-                rows = self.driver.find_elements(By.XPATH, "//table//tr[position()>1]")
-                for row in rows:
-                    cells = row.find_elements(By.TAG_NAME, "td")
-                    if cells:
-                        data["items"].append(
-                            {
-                                "item_number": cells[0].text if len(cells) > 0 else "",
-                                "description": cells[1].text if len(cells) > 1 else "",
-                                "quantity": cells[2].text if len(cells) > 2 else "",
-                                "unit": cells[3].text if len(cells) > 3 else "",
-                            }
-                        )
-                log(f"📋 {len(data['items'])} itens extraídos", "SUCCESS")
-            except Exception:
-                log("⚠️ Não foi possível extrair itens", "WARNING")
-
+            linhas = alvo.find_elements(By.XPATH, ".//tr[position()>1]")
+            for linha in linhas:
+                celulas = linha.find_elements(By.TAG_NAME, "td")
+                if celulas:
+                    data["items"].append(
+                        {
+                            "item_number": celulas[0].text if len(celulas) > 0 else "",
+                            "description": celulas[1].text if len(celulas) > 1 else "",
+                            "quantity": celulas[2].text if len(celulas) > 2 else "",
+                            "unit": celulas[3].text if len(celulas) > 3 else "",
+                        }
+                    )
+            log(f"📋 {len(data['items'])} itens extraídos", "SUCCESS")
             return data
 
         except Exception as exc:  # noqa: BLE001
@@ -418,13 +430,22 @@ class PetronectBot:
             return False
 
         try:
-            attach_btn = self.driver.find_element(
-                By.XPATH, "//button[contains(@title, 'Attachment') or contains(@class, 'attach')]"
-            )
-            attach_btn.click()
-            time.sleep(self.config.delay_seconds)
+            try:
+                attach_btn = self.driver.find_element(
+                    By.XPATH,
+                    "//button[contains(translate(., 'ANEXO', 'anexo'), 'anexo') or "
+                    "contains(@title, 'Attachment') or contains(@class, 'attach')]",
+                )
+                attach_btn.click()
+                time.sleep(self.config.delay_seconds)
+            except Exception:
+                log("ℹ️ Botão de anexos não encontrado; tentando links diretos.", "INFO")
 
-            links = self.driver.find_elements(By.XPATH, "//a[contains(@href, 'download')]")
+            links = self.driver.find_elements(
+                By.XPATH,
+                "//a[contains(@href, 'download') or contains(translate(text(),'ANEXO','anexo'),'anexo') "
+                "or contains(translate(text(),'DOWNLOAD','download'),'download')]",
+            )
             log(f"📎 {len(links)} anexos encontrados")
 
             for index, link in enumerate(links, 1):
@@ -463,13 +484,6 @@ class PetronectBot:
 
         try:
             folder = criar_pasta(self.config, opp)
-
-            if not self.acessar_petronect(opp):
-                if self.driver:
-                    self.driver.close()
-                    self.driver.switch_to.window(self.driver.window_handles[0])
-                return False
-
             data = self.extrair_dados()
             self.baixar_anexos(folder)
 
@@ -477,10 +491,6 @@ class PetronectBot:
             atualizar_master(self.config, opp, data)
 
             self.save_log(opp)
-
-            if self.driver:
-                self.driver.close()
-                self.driver.switch_to.window(self.driver.window_handles[0])
 
             log(f"{'=' * 60}")
             log(f"✅ {opp} CONCLUÍDA!", "SUCCESS")
@@ -497,12 +507,44 @@ class PetronectBot:
                 pass
             return False
 
-    def executar_varredura(self) -> None:
+    def processar_oportunidade_da_lista(self, opp: str) -> bool:
+        handle_lista = self.abrir_oportunidade_da_lista(opp)
+        if not handle_lista:
+            return False
+        try:
+            sucesso = self.processar_oportunidade(opp)
+        finally:
+            self.voltar_para_lista(handle_lista)
+        return sucesso
+
+    def ir_para_proxima_pagina(self) -> bool:
+        if not self.driver or not self.wait:
+            return False
+
+        seletores = [
+            "//a[contains(translate(., 'PRÓXIMA', 'próxima'), 'próxima')]",
+            "//a[contains(translate(., 'PROXIMA', 'proxima'), 'proxima')]",
+            "//a[contains(translate(., 'NEXT', 'next'), 'next')]",
+            "//button[contains(., '>') or contains(., '→')]",
+        ]
+
+        for xpath in seletores:
+            try:
+                botao = self.wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
+                disabled_attr = botao.get_attribute("disabled")
+                if disabled_attr or "disabled" in botao.get_attribute("class", "").lower():
+                    continue
+                botao.click()
+                time.sleep(self.config.delay_seconds)
+                log("➡️ Avançando para próxima página", "INFO")
+                return True
+            except Exception:
+                continue
+        return False
+
+    def executar_varredura(self, termo_objeto: str = "Válvula") -> None:
         log("\n" + "=" * 80)
-        if self.first_run:
-            log("🚀 PRIMEIRA EXECUÇÃO - Varredura completa desde Junho/2024")
-        else:
-            log("🔄 Varredura incremental - Apenas novos emails")
+        log(f"🚀 Varredura por oportunidades com objeto '{termo_objeto}'")
         log("=" * 80 + "\n")
 
         if not self.conectar_chrome_aberto():
@@ -510,29 +552,43 @@ class PetronectBot:
             log("Execute o comando: python petronect_bot.py --open-chrome")
             return
 
-        opps = self.buscar_emails_petronect()
-        if not opps:
-            log("\nℹ️ Nenhuma nova oportunidade encontrada", "WARNING")
+        if not self.navegar_para_lista():
             return
 
-        log(f"\n📊 {len(opps)} oportunidades para processar\n")
+        self.aplicar_filtro_objeto(termo_objeto)
 
+        pagina = 1
         sucesso = 0
         falhas = 0
 
-        for index, opp in enumerate(opps, 1):
-            log(f"\n[{index}/{len(opps)}]")
-            if self.processar_oportunidade(opp):
-                sucesso += 1
-            else:
-                falhas += 1
-            time.sleep(self.config.delay_seconds)
+        while True:
+            log(f"\n🧭 Página {pagina}")
+            opps = self.coletar_oportunidades_pagina()
+            if not opps:
+                log("ℹ️ Nenhuma oportunidade nesta página.", "WARNING")
+
+            for index, opp in enumerate(opps, 1):
+                log(f"\n[{index}/{len(opps)}] Preparando oportunidade {opp}")
+                if opp in self.processed:
+                    log(f"⏭️ {opp} já registrada no log, pulando.", "INFO")
+                    continue
+                if self.processar_oportunidade_da_lista(opp):
+                    sucesso += 1
+                    log(f"✅ Downloads concluídos para {opp}", "SUCCESS")
+                else:
+                    falhas += 1
+                    log(f"❌ Falha ao processar {opp}", "ERROR")
+
+            if not self.ir_para_proxima_pagina():
+                break
+            pagina += 1
 
         if self.first_run:
-            with open("first_run.flag", "w") as file:
-                json.dump({"date": datetime.now().isoformat(), "processed": len(opps)}, file)
+            with open(self.first_run_file, "w") as file:
+                json.dump({"date": datetime.now().isoformat(), "processed": len(self.processed)}, file)
             log("\n✅ Primeira execução marcada como completa!", "SUCCESS")
 
+        log("\n🎉 Todas as páginas percorridas e downloads finalizados.", "SUCCESS")
         log("\n" + "=" * 80)
         log("📈 RESUMO FINAL")
         log("=" * 80)
@@ -581,7 +637,7 @@ def abrir_chrome_debug(config: BotConfig) -> bool:
         chrome_exe,
         f"--remote-debugging-port={config.chrome_debug_port}",
         f"--user-data-dir={user_data}",
-        "https://titan.hostgator.com.br/mail/",
+        config.petronect_url,
     ]
 
     log("🚀 Abrindo Chrome...")
@@ -590,7 +646,7 @@ def abrir_chrome_debug(config: BotConfig) -> bool:
         subprocess.Popen(cmd)
         log("✅ Chrome aberto!", "SUCCESS")
         log("=" * 60)
-        log("👉 Faça login no email manualmente e execute: python petronect_bot.py --scan")
+        log("👉 Deixe a aba aberta para o controle remoto e execute: python petronect_bot.py --scan")
         log("=" * 60)
         return True
     except Exception as exc:  # noqa: BLE001
@@ -599,8 +655,15 @@ def abrir_chrome_debug(config: BotConfig) -> bool:
 
 
 def mostrar_processados() -> None:
+    log_file = None
+    if Path.home().joinpath("petronect").exists():
+        candidato = Path.home() / "petronect" / "processed.json"
+        if candidato.exists():
+            log_file = candidato
     if Path("processed.json").exists():
-        with open("processed.json") as file:
+        log_file = Path("processed.json")
+    if log_file and log_file.exists():
+        with open(log_file) as file:
             proc = json.load(file)
         df = pd.DataFrame({"Oportunidades Processadas": proc})
         print(df)
@@ -649,6 +712,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--root", type=Path, help="Caminho raiz para salvar dados (padrão: ~/petronect).")
     parser.add_argument("--chrome-port", type=int, default=9222, help="Porta de depuração remota do Chrome.")
     parser.add_argument("--chrome-path", type=Path, help="Caminho completo do executável do Chrome.")
+    parser.add_argument(
+        "--objeto",
+        type=str,
+        default="Válvula",
+        help="Texto do campo 'Objeto' para filtrar oportunidades (padrão: Válvula).",
+    )
     args, unknown = parser.parse_known_args(argv)
     if unknown:
         log(f"Ignorando argumentos desconhecidos (provavelmente do Jupyter/IPython): {unknown}", "WARNING")
@@ -674,7 +743,7 @@ def main() -> None:
 
     if args.scan:
         bot = PetronectBot(config)
-        bot.executar_varredura()
+        bot.executar_varredura(args.objeto)
         any_action = True
 
     if args.list_processed:
@@ -688,7 +757,7 @@ def main() -> None:
     if not any_action:
         log("Nenhuma opção fornecida; executando varredura (--scan) por padrão.", "WARNING")
         bot = PetronectBot(config)
-        bot.executar_varredura()
+        bot.executar_varredura(args.objeto)
 
 
 if __name__ == "__main__":
