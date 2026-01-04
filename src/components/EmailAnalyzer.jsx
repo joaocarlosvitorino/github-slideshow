@@ -50,8 +50,7 @@ const EmailAnalyzer = () => {
           },
           { name: 'screenshot.png', type: 'image', size: '230 KB' }
         ],
-        aiSummary:
-          'Cliente reporta falha crítica no servidor de produção com sistema fora do ar. Requer ação imediata da equipe técnica.',
+        aiSummary: 'Cliente reporta falha crítica no servidor de produção com sistema fora do ar. Requer ação imediata da equipe técnica.',
         suggestedTask: {
           title: 'Resolver problema servidor produção - Cliente ABC',
           priority: 'urgent',
@@ -77,8 +76,7 @@ const EmailAnalyzer = () => {
           },
           { name: 'termos.docx', type: 'document', size: '85 KB' }
         ],
-        aiSummary:
-          'Proposta de renovação contratual com valor de R$ 450k. Prazo para resposta: 15 dias. Desconto de 15% disponível para pagamento à vista.',
+        aiSummary: 'Proposta de renovação contratual com valor de R$ 450k. Prazo para resposta: 15 dias. Desconto de 15% disponível para pagamento à vista.',
         suggestedTask: {
           title: 'Analisar proposta renovação contrato 2025',
           priority: 'high',
