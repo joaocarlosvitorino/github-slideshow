@@ -452,7 +452,7 @@ a.lk:hover{text-decoration:underline}
   function enquadraMapa() {
     if (!GEO) return;
     const [x0, y0, x1, y1] = GEO.limites;
-    const k = Math.min((W - 40) / (x1 - x0), (H - 150) / (y1 - y0));
+    const k = Math.min((W - (W < 640 ? 110 : 40)) / (x1 - x0), (H - 150) / (y1 - y0));
     vista.k = Math.max(0.2, Math.min(4, k));
     vista.x = -((x0 + x1) / 2) * vista.k; vista.y = -((y0 + y1) / 2) * vista.k + 40;
   }
